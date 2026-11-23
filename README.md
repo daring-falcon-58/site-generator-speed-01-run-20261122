@@ -24,7 +24,7 @@ Nothing is cached from one case to the next — every case is answered alone, fr
 - **Practice set: 3 of 3 cases byte-identical** to makefun-site 1.0.0's expected outputs (canonical-JSON compare against the kit's `practice/reference/expected.json`, and byte-identical `answers.json` against the house driver run on the same input).
 - **Fuzz: 108 of 108 extra generated cases byte-identical** to the reference `build` — two batches of 18 random sha256 seeds × 3 cases each, drawn with the kit's own generator (`program/generator/draw.ts` + `subject/sites.mjs`), covering all three size bands, drafts, non-ASCII titles, slug collisions, refused front matter, broken links and the Markdown the reference does not support. Two separate runs of the same case also write byte-identical output (determinism checked).
 - **Speed, `run()` only** (local node v24.22.1; the harness uses node22): median over 7 rounds, measured twice — g-0001: 39–63 ms vs baseline 128–134 ms (**2.0–3.4×**); g-0002: 53–56 ms vs 201–205 ms (**3.7–3.8×**); g-0003: 56–58 ms vs 228–233 ms (**4.0×**). Trimmed mean over 15 interleaved rounds, four runs: g-0001 **3.1–3.9×**, g-0002 **2.9–3.2×**, g-0003 **3.2–3.7×**. (The previous live entry measured 2.11× / 2.20× / 2.09× on the same method.)
-- **Speed, full driver wall** (including JSON parse/stringify and node startup, median of 7): ~679 ms vs baseline ~1033 ms (**~1.52×**). The driver is the house `main.ts` kept verbatim, including `--no-incremental-marking`.
+- **Speed, full driver wall** (including JSON parse/stringify and node startup, single runs): ~676 ms vs baseline ~1039 ms (**~1.54×**). The driver is the house `main.ts` kept verbatim, including `--no-incremental-marking`.
 
 ## Run it
 
