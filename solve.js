@@ -4,16 +4,21 @@
 // object of every path it writes and that file's text. Written from the
 // reference spec (its README + code) as a single-pass implementation:
 //  - fused block lexer+renderer (no token objects, no second pass),
-//  - bulk-escape inline renderer (plain runs escaped in one regex pass, and
-//    only when the run holds a special character at all),
+//  - fused inline scan: one regex jump per construct, and the HTML escapes
+//    (& < > " ') are emitted right at the scan hit, so a plain run between
+//    hits holds no special character and is pushed raw — no second esc()
+//    pass over plain runs (r3; esc was ~15% of r2's time),
+//  - string-accumulated output (r3): templates compiled to functions that
+//    build their result with += (rope appends, flattened once by the
+//    driver's JSON.stringify) instead of chunk-array + join per render;
+//    renderMarkdown and inline return strings the same way (the interpreter
+//    fallback still uses arrays),
 //  - ASCII fast-path slugify (no NFKD normalise for plain-ASCII text),
-//  - allocation-light template walk (array output + join), with templates
-//    compiled once per case to plain functions (interpreter fallback if the
-//    compile ever fails),
 //  - inline scan by one regex jump per construct, escape searches by
 //    indexOf + backslash parity, first-character block dispatch,
 //  - word counting by a whitespace table, front matter without splitting
-//    the body.
+//    the body, front-matter keys parsed manually (no per-line regex),
+//  - per-case memo of resolved link paths (fresh Map per build()).
 // No cross-case caching: every case is answered alone, from its input only.
 
 const REPORT_FILE = 'build-report.txt';
@@ -222,10 +227,22 @@ function parseFrontMatter(text) {
   for (let j = 0; j < fm.length; j++) {
     const line = fm[j];
     if (BLANK_LINE.test(line) || line.startsWith('#')) continue;
-    const m = LINE.exec(line);
-    if (!m) return { error: `line ${j + 2} is not "key: value"` };
-    const key = m[1];
-    const raw = (m[2] ?? '').replace(TRAIL_WS, '');
+    // Manual `key: value` split: the LINE regex /^([a-z_]+):(?: (.*))?$/
+    // means one ':' with the key all [a-z_], then end or one space + rest.
+    const colon = line.indexOf(':');
+    if (colon <= 0) return { error: `line ${j + 2} is not "key: value"` };
+    let badKey = false;
+    for (let q = 0; q < colon; q++) {
+      const cc = line.charCodeAt(q);
+      if (!((cc >= 97 && cc <= 122) || cc === 95)) { badKey = true; break; }
+    }
+    if (badKey) return { error: `line ${j + 2} is not "key: value"` };
+    const key = line.slice(0, colon);
+    let raw;
+    if (colon === line.length - 1) raw = '';
+    else if (line.charCodeAt(colon + 1) === 32) raw = line.slice(colon + 2);
+    else return { error: `line ${j + 2} is not "key: value"` };
+    raw = raw.replace(TRAIL_WS, '');
     if (!KEYS.includes(key)) return { error: `unknown key "${key}"` };
     if (Object.hasOwn(data, key)) return { error: `key "${key}" is given twice` };
     if (raw === '') return { error: `key "${key}" has no value` };
@@ -320,17 +337,20 @@ function findSingleStar(s, from) {
 
 /**
  * `s` rendered inline into `out` (an array of string chunks); `env.link`
- * resolves a link's href. Plain runs are escaped in bulk — one regex pass
- * per run, never one call per character. Constructs that fail to close stay
- * in the plain run, exactly as the reference renders them literally.
- * The scan jumps from one special character (\\, `, *, [) to the next with
- * one regex scan instead of stepping every character.
+ * resolves a link's href. Constructs that fail to close stay in the plain
+ * run, exactly as the reference renders them literally. The scan jumps from
+ * one special character (\\, `, *, [, &, <, >, ", ') to the next with one
+ * regex scan instead of stepping every character, and the HTML escapes are
+ * emitted right at the scan hit — so a plain run between two hits holds no
+ * special character at all and is pushed raw, with no second esc() pass
+ * over it (esc was ~15% of r2's time, mostly these runs). One shared regex:
+ * every exec is preceded by setting lastIndex, so the recursion into
+ * strong/em/link text cannot corrupt an outer scan.
  */
-function inline(s, env, out) {
-  // One C++ regex scan jumps to the next special (\, `, *, [); a fresh
-  // regex per call, so the recursion into strong/em/link text cannot
-  // corrupt an outer scan (verified 0 mismatches on 11,449 real paragraphs).
-  const re = /[\\`*[]/g;
+const INLINE_RE = /[\\`*\[&<>"']/g;
+function inline(s, env) {
+  const re = INLINE_RE;
+  let o = '';
   const n = s.length;
   let i = 0;
   let plain = 0;
@@ -343,9 +363,9 @@ function inline(s, env, out) {
     if (c === 92) {
       // backslash: escaped only before an escapable character
       if (i + 1 < n && ESCAPABLE.has(s[i + 1])) {
-        if (i > plain) out.push(esc(s.slice(plain, i)));
+        if (i > plain) o += s.slice(plain, i);
         const d = s[i + 1];
-        out.push(d === '>' ? '&gt;' : d);
+        o += d === '>' ? '&gt;' : d;
         i += 2;
         plain = i;
       } else i++;
@@ -355,8 +375,8 @@ function inline(s, env, out) {
       // backtick: code span closed by the next backtick (plain indexOf)
       const j = s.indexOf('`', i + 1);
       if (j > i + 1) {
-        if (i > plain) out.push(esc(s.slice(plain, i)));
-        out.push('<code>', esc(s.slice(i + 1, j)), '</code>');
+        if (i > plain) o += s.slice(plain, i);
+        o += '<code>' + esc(s.slice(i + 1, j)) + '</code>';
         i = j + 1;
         plain = i;
       } else i++;
@@ -367,10 +387,8 @@ function inline(s, env, out) {
       if (s.charCodeAt(i + 1) === 42) {
         const j = findUnescaped(s, '**', i + 2);
         if (j > i + 2) {
-          if (i > plain) out.push(esc(s.slice(plain, i)));
-          out.push('<strong>');
-          inline(s.slice(i + 2, j), env, out);
-          out.push('</strong>');
+          if (i > plain) o += s.slice(plain, i);
+          o += '<strong>' + inline(s.slice(i + 2, j), env) + '</strong>';
           i = j + 2;
           plain = i;
         } else i += 2;
@@ -378,13 +396,19 @@ function inline(s, env, out) {
       }
       const j = findSingleStar(s, i + 1);
       if (j > i + 1) {
-        if (i > plain) out.push(esc(s.slice(plain, i)));
-        out.push('<em>');
-        inline(s.slice(i + 1, j), env, out);
-        out.push('</em>');
+        if (i > plain) o += s.slice(plain, i);
+        o += '<em>' + inline(s.slice(i + 1, j), env) + '</em>';
         i = j + 1;
         plain = i;
       } else i++;
+      continue;
+    }
+    if (c === 38 || c === 60 || c === 62 || c === 34 || c === 39) {
+      // HTML special inside a plain run: emit its escape at the hit.
+      if (i > plain) o += s.slice(plain, i);
+      o += c === 38 ? '&amp;' : c === 60 ? '&lt;' : c === 62 ? '&gt;' : c === 34 ? '&quot;' : '&#39;';
+      i++;
+      plain = i;
       continue;
     }
     // [: [text](target)
@@ -392,22 +416,19 @@ function inline(s, env, out) {
     const m2 = k !== -1 && s.charCodeAt(k + 1) === 40 ? s.indexOf(')', k + 2) : -1;
     const target = m2 === -1 ? '' : s.slice(k + 2, m2);
     if (target !== '' && !/\s/.test(target)) {
-      if (i > plain) out.push(esc(s.slice(plain, i)));
-      out.push('<a href="', esc(env.link(target)), '">');
-      inline(s.slice(i + 1, k), env, out);
-      out.push('</a>');
+      if (i > plain) o += s.slice(plain, i);
+      o += '<a href="' + esc(env.link(target)) + '">' + inline(s.slice(i + 1, k), env) + '</a>';
       i = m2 + 1;
       plain = i;
     } else i++;
   }
-  if (n > plain) out.push(esc(s.slice(plain, n)));
+  if (n > plain) o += s.slice(plain, n);
+  return o;
 }
 
 /** `s` rendered inline, as one string. */
 function inlineStr(s, env) {
-  const out = [];
-  inline(s, env, out);
-  return out.join('');
+  return inline(s, env);
 }
 
 /**
@@ -420,7 +441,7 @@ function renderMarkdown(src, env) {
   const lines = src.split('\n');
   const n = lines.length;
   const ids = new Set();
-  const out = [];
+  let html = '';
   const toc = [];
   let excerpt = null;
   let i = 0;
@@ -440,39 +461,35 @@ function renderMarkdown(src, env) {
       while (i < n && !isFenceClose(lines[i])) body.push(lines[i++]);
       i++;
       const cls = fence[1] === '' ? '' : ` class="language-${esc(fence[1])}"`;
-      out.push(`<pre><code${cls}>`);
-      for (let k = 0; k < body.length; k++) out.push(esc(body[k]), '\n');
-      out.push('</code></pre>\n');
+      html += `<pre><code${cls}>`;
+      for (let k = 0; k < body.length; k++) { html += esc(body[k]); html += '\n'; }
+      html += '</code></pre>\n';
       continue;
     }
     const heading = c0 === 35 ? headingOf(line) : null;
     if (heading !== null) {
       const id = uniqueSlug(slugify(heading.text), ids);
-      const html = inlineStr(heading.text, env);
-      out.push(`<h${heading.depth} id="${id}">${html}</h${heading.depth}>\n`);
-      if (heading.depth === 2 || heading.depth === 3) toc.push({ level: heading.depth, id, html });
+      const hhtml = inlineStr(heading.text, env);
+      html += `<h${heading.depth} id="${id}">${hhtml}</h${heading.depth}>\n`;
+      if (heading.depth === 2 || heading.depth === 3) toc.push({ level: heading.depth, id, html: hhtml });
       i++;
       continue;
     }
     if ((c0 === 45 || c0 === 42) && HR.test(line)) {
-      out.push('<hr>\n');
+      html += '<hr>\n';
       i++;
       continue;
     }
     if (line[0] === '>') {
       const body = [];
-      while (i < n && lines[i][0] === '>') body.push(lines[i++].replace(/^> ?/, ''));
+      while (i < n && lines[i][0] === '>') { const l = lines[i++]; body.push(l.charCodeAt(1) === 32 ? l.slice(2) : l.slice(1)); }
       const inner = [];
       for (let k = 0; k < body.length; k++) {
         const t = trimLine(body[k]);
         if (t !== '') inner.push(t);
       }
-      if (inner.length === 0) out.push('<blockquote>\n</blockquote>\n');
-      else {
-        out.push('<blockquote>\n<p>');
-        inline(inner.join('\n'), env, out);
-        out.push('</p>\n</blockquote>\n');
-      }
+      if (inner.length === 0) html += '<blockquote>\n</blockquote>\n';
+      else html += '<blockquote>\n<p>' + inline(inner.join('\n'), env) + '</p>\n</blockquote>\n';
       continue;
     }
     const bullet = (c0 === 45 || c0 === 42) ? BULLET.exec(line) : null;
@@ -494,29 +511,22 @@ function renderMarkdown(src, env) {
       const start = isOrdered ? Number(ordered[1]) : 1;
       const tag = isOrdered ? 'ol' : 'ul';
       const open = isOrdered && start !== 1 ? `<ol start="${start}">` : `<${tag}>`;
-      out.push(open, '\n');
-      for (let k = 0; k < items.length; k++) {
-        out.push('<li>');
-        inline(items[k].join('\n'), env, out);
-        out.push('</li>\n');
-      }
-      out.push(`</${tag}>\n`);
+      html += open + '\n';
+      for (let k = 0; k < items.length; k++) html += '<li>' + inline(items[k].join('\n'), env) + '</li>\n';
+      html += `</${tag}>\n`;
       continue;
     }
     const body = [trimLine(line)];
     i++;
     while (i < n && !endsParagraph(lines[i])) body.push(trimLine(lines[i++]));
     if (excerpt === null) {
-      const html = inlineStr(body.join('\n'), env);
-      excerpt = html;
-      out.push(`<p>${html}</p>\n`);
+      excerpt = inline(body.join('\n'), env);
+      html += `<p>${excerpt}</p>\n`;
     } else {
-      out.push('<p>');
-      inline(body.join('\n'), env, out);
-      out.push('</p>\n');
+      html += '<p>' + inline(body.join('\n'), env) + '</p>\n';
     }
   }
-  return { html: out.join(''), toc, excerpt: excerpt ?? '' };
+  return { html, toc, excerpt: excerpt ?? '' };
 }
 
 // ---------------------------------------------------------------- template
@@ -765,13 +775,13 @@ function cgPath(lines, path) {
 function cgNodes(lines, nodes) {
   for (const n of nodes) {
     if (n.kind === 'text') {
-      lines.push(`out.push(${JSON.stringify(n.text)});`);
+      lines.push(`_s += ${JSON.stringify(n.text)};`);
     } else if (n.kind === 'var') {
       const tv = cgPath(lines, n.path);
-      lines.push(`out.push(E(T(${tv})));`);
+      lines.push(`_s += E(T(${tv}));`);
     } else if (n.kind === 'raw') {
       const tv = cgPath(lines, n.path);
-      lines.push(`out.push(T(${tv}));`);
+      lines.push(`_s += T(${tv});`);
     } else if (n.kind === 'if') {
       const tv = cgPath(lines, n.path);
       lines.push(`if (F(${tv}) !== ${n.not}) {`);
@@ -805,7 +815,7 @@ function cgNodes(lines, nodes) {
       lines.push('}');
     } else if (n.kind === 'include') {
       const id = __cgNext++;
-      lines.push(`if (D < ${INCLUDE_DEPTH}) { const _f${id} = C.compiled.get(${JSON.stringify(n.name)}); if (_f${id} !== undefined) _f${id}(out, R, C, D + 1, L, T, E, F, H); }`);
+      lines.push(`if (D < ${INCLUDE_DEPTH}) { const _f${id} = C.compiled.get(${JSON.stringify(n.name)}); if (_f${id} !== undefined) _s += _f${id}(R, C, D + 1, L, T, E, F, H); }`);
     }
   }
 }
@@ -813,9 +823,10 @@ function cgNodes(lines, nodes) {
 /** A parsed template's nodes as a callable function (throws on any failure). */
 function compileTemplate(nodes) {
   __cgNext = 0;
-  const lines = [];
+  const lines = ["let _s = '';"];
   cgNodes(lines, nodes);
-  return new Function('out', 'R', 'C', 'D', 'L', 'T', 'E', 'F', 'H', lines.join('\n'));
+  lines.push('return _s;');
+  return new Function('R', 'C', 'D', 'L', 'T', 'E', 'F', 'H', lines.join('\n'));
 }
 
 // ---------------------------------------------------------------- build
@@ -904,7 +915,7 @@ function build(input) {
   };
 
   // Sources first, sorted by path in code-unit order; only .md is a source.
-  const files = [...input.files].sort((x, y) => byCodeUnits(x.path, y.path));
+  const files = [...input.files].sort((x, y) => (x.path < y.path ? -1 : x.path > y.path ? 1 : 0));
   for (let k = 0; k < files.length; k++) {
     const f = files[k];
     if (f.path.endsWith('.md')) b.sources.push({ path: f.path, content: f.content.includes('\r') ? f.content.replace(/\r\n?/g, '\n') : f.content });
@@ -962,7 +973,10 @@ function build(input) {
   }
 
   // Markdown: every source's body, links resolved against its directory.
+  // Resolved relative paths repeat a lot (assets, index links): memoize
+  // them per case (fresh Map per build(), never shared across cases).
   const staticPaths = new Set(b.statics.map((f) => f.path));
+  const resolveCache = new Map();
   for (let k = 0; k < b.sources.length; k++) {
     const s = b.sources[k];
     const dir = dirOf(s.path);
@@ -972,7 +986,13 @@ function build(input) {
         const hash = target.indexOf('#');
         const rel = hash === -1 ? target : target.slice(0, hash);
         const frag = hash === -1 ? '' : target.slice(hash);
-        const path = rel === '' ? null : resolvePath(dir, rel);
+        let path;
+        if (rel === '') path = null;
+        else {
+          const ck = dir + '\0' + rel;
+          if (resolveCache.has(ck)) path = resolveCache.get(ck);
+          else { path = resolvePath(dir, rel); resolveCache.set(ck, path); }
+        }
         if (path !== null && b.bySource.has(path)) return b.bySource.get(path).url + frag;
         if (path !== null && staticPaths.has(path)) return `${b.base}/${path}${frag}`;
         b.broken.add(`broken-link ${s.path} -> ${target}`);
@@ -1040,16 +1060,15 @@ function build(input) {
   const ctx = { templates: b.templates, compiled };
   const render = (name, vars) => {
     const R = { site, tags: allTags, recent, ...vars };
-    const out = [];
     if (useCompiled) {
       const fn = compiled.get(name);
       if (fn === undefined) return null;
-      fn(out, R, ctx, 0, {}, textOf, esc, truthy, Object.hasOwn);
-    } else {
-      const nodes = b.templates.get(name);
-      if (nodes === undefined) return null;
-      renderNodes(nodes, { vars: R, parent: null }, ctx, 0, out);
+      return fn(R, ctx, 0, {}, textOf, esc, truthy, Object.hasOwn);
     }
+    const nodes = b.templates.get(name);
+    if (nodes === undefined) return null;
+    const out = [];
+    renderNodes(nodes, { vars: R, parent: null }, ctx, 0, out);
     return out.join('');
   };
   for (let k = 0; k < b.sources.length; k++) {
@@ -1091,7 +1110,8 @@ function build(input) {
 
   // Report: every report line and broken link, sorted, then the summary.
   const lines = [...b.report, ...b.broken].sort(byCodeUnits);
-  const pageCount = b.sources.filter((s) => !s.post).length;
+  let pageCount = 0;
+  for (let k = 0; k < b.sources.length; k++) if (!b.sources[k].post) pageCount++;
   lines.push(`built ${pageCount} pages, ${b.posts.length} posts, ${b.tags.length} tags and ${b.statics.length} static files`);
   b.output[REPORT_FILE] = lines.join('\n') + '\n';
   return b.output;
