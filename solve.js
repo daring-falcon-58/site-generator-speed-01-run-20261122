@@ -19,6 +19,10 @@
 //  - word counting by a whitespace table, front matter without splitting
 //    the body, front-matter keys parsed manually (no per-line regex),
 //  - per-case memo of resolved link paths (fresh Map per build()).
+//  - (r4) branchless word counting (a word starts where a non-whitespace
+//    char follows whitespace — same table, same count, no branch per char),
+//    and block rendering that accumulates its strings directly instead of
+//    via intermediate line arrays (fences, blockquotes, lists, paragraphs).
 // No cross-case caching: every case is answered alone, from its input only.
 
 const REPORT_FILE = 'build-report.txt';
@@ -106,18 +110,19 @@ const WS_TABLE = (() => {
   return t;
 })();
 
-/** The words of a body: its runs of characters other than whitespace. */
+/** The words of a body: its runs of characters other than whitespace.
+ * Branchless (r4): a word starts exactly where a non-whitespace char
+ * follows a whitespace char (or the start) — same WS_TABLE, same count,
+ * no if/else per character. */
 function wordsOf(text) {
   let n = 0;
-  let inWord = 0;
+  let prevWs = 1;
   const t = WS_TABLE;
   const len = text.length;
   for (let i = 0; i < len; i++) {
-    if (t[text.charCodeAt(i)]) inWord = 0;
-    else {
-      n += inWord ^ 1;
-      inWord = 1;
-    }
+    const w = t[text.charCodeAt(i)];
+    n += (w ^ 1) & prevWs;
+    prevWs = w;
   }
   return n;
 }
@@ -456,13 +461,11 @@ function renderMarkdown(src, env) {
     }
     const fence = c0 === 96 && line.startsWith('```') ? FENCE_OPEN.exec(line) : null;
     if (fence !== null) {
-      const body = [];
-      i++;
-      while (i < n && !isFenceClose(lines[i])) body.push(lines[i++]);
       i++;
       const cls = fence[1] === '' ? '' : ` class="language-${esc(fence[1])}"`;
       html += `<pre><code${cls}>`;
-      for (let k = 0; k < body.length; k++) { html += esc(body[k]); html += '\n'; }
+      while (i < n && !isFenceClose(lines[i])) { html += esc(lines[i]); html += '\n'; i++; }
+      i++;
       html += '</code></pre>\n';
       continue;
     }
@@ -481,15 +484,17 @@ function renderMarkdown(src, env) {
       continue;
     }
     if (line[0] === '>') {
-      const body = [];
-      while (i < n && lines[i][0] === '>') { const l = lines[i++]; body.push(l.charCodeAt(1) === 32 ? l.slice(2) : l.slice(1)); }
-      const inner = [];
-      for (let k = 0; k < body.length; k++) {
-        const t = trimLine(body[k]);
-        if (t !== '') inner.push(t);
+      // The trimmed non-empty lines accumulated directly: identical to
+      // inner.join('\n') over the same lines, without the two arrays.
+      let inner = '';
+      let first = true;
+      while (i < n && lines[i][0] === '>') {
+        const l = lines[i++];
+        const t = trimLine(l.charCodeAt(1) === 32 ? l.slice(2) : l.slice(1));
+        if (t !== '') { if (!first) inner += '\n'; inner += t; first = false; }
       }
-      if (inner.length === 0) html += '<blockquote>\n</blockquote>\n';
-      else html += '<blockquote>\n<p>' + inline(inner.join('\n'), env) + '</p>\n</blockquote>\n';
+      if (first) html += '<blockquote>\n</blockquote>\n';
+      else html += '<blockquote>\n<p>' + inline(inner, env) + '</p>\n</blockquote>\n';
       continue;
     }
     const bullet = (c0 === 45 || c0 === 42) ? BULLET.exec(line) : null;
@@ -497,33 +502,38 @@ function renderMarkdown(src, env) {
     if (bullet !== null || ordered !== null) {
       const isOrdered = ordered !== null;
       const marker = isOrdered ? ORDERED : BULLET;
+      // Each item as one accumulated string: identical to
+      // items[k].join('\n') over the same trimmed lines.
       const items = [];
+      let cur = null;
       while (i < n) {
         const m = marker.exec(lines[i]);
         if (m !== null) {
-          items.push([trimLine(isOrdered ? m[2] : m[1])]);
+          if (cur !== null) items.push(cur);
+          cur = trimLine(isOrdered ? m[2] : m[1]);
           i++;
         } else if (lines[i].charCodeAt(0) === 32 && lines[i].charCodeAt(1) === 32 && CONTINUED.test(lines[i])) {
-          items[items.length - 1].push(trimLine(lines[i]));
+          cur += '\n' + trimLine(lines[i]);
           i++;
         } else break;
       }
+      if (cur !== null) items.push(cur);
       const start = isOrdered ? Number(ordered[1]) : 1;
       const tag = isOrdered ? 'ol' : 'ul';
       const open = isOrdered && start !== 1 ? `<ol start="${start}">` : `<${tag}>`;
       html += open + '\n';
-      for (let k = 0; k < items.length; k++) html += '<li>' + inline(items[k].join('\n'), env) + '</li>\n';
+      for (let k = 0; k < items.length; k++) html += '<li>' + inline(items[k], env) + '</li>\n';
       html += `</${tag}>\n`;
       continue;
     }
-    const body = [trimLine(line)];
+    let ptext = trimLine(line);
     i++;
-    while (i < n && !endsParagraph(lines[i])) body.push(trimLine(lines[i++]));
+    while (i < n && !endsParagraph(lines[i])) { ptext += '\n' + trimLine(lines[i]); i++; }
     if (excerpt === null) {
-      excerpt = inline(body.join('\n'), env);
+      excerpt = inline(ptext, env);
       html += `<p>${excerpt}</p>\n`;
     } else {
-      html += '<p>' + inline(body.join('\n'), env) + '</p>\n';
+      html += '<p>' + inline(ptext, env) + '</p>\n';
     }
   }
   return { html, toc, excerpt: excerpt ?? '' };
